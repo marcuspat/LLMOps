@@ -1,0 +1,297 @@
+name: GitHub Security Manager
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:
+
+env:
+  SECURITY_MANAGER_AUTO_SCAN: true
+  SECURITY_MANAGER_POLICY_ENFORCEMENT: true
+
+jobs:
+  security-scan:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      scan-results: ${{ steps.scan.outputs.results }}
+      critical-issues: ${{ steps.scan.outputs.critical-issues }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run SAST scan
+        run: |
+          npm run github-security-manager:sast \
+            --repo=${{ github.repository }} \
+            --ref=${{ github.ref }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run dependency vulnerability scan
+        run: |
+          npm run github-security-manager:dependency-scan \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run container security scan
+        if: contains(github.event.head_commit.modified, 'Dockerfile')
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ github.repository }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        if: contains(github.event.head_commit.modified, 'Dockerfile')
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Check for secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          debug: true
+
+      - name: Consolidate security results
+        id: scan
+        run: |
+          npm run github-security-manager:consolidate-results \
+            --output-file=security-results.json \
+            --critical-threshold=${{ steps.scan.outputs.critical-count }}
+
+      - name: Upload security results
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-${{ github.sha }}
+          path: security-results.json
+          retention-days: 30
+
+  vulnerability-assessment:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    needs: security-scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download security scan results
+        uses: actions/download-artifact@v4
+        with:
+          name: security-scan-${{ github.sha }}
+          path: security-results/
+
+      - name: Assess vulnerabilities
+        run: |
+          npm run github-security-manager:assess \
+            --input-file=security-results/security-results.json \
+            --output-file=vulnerability-assessment.json \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post security assessment to PR
+        if: github.event_name == 'pull_request'
+        run: |
+          npm run github-security-manager:post-assessment \
+            --assessment-file=vulnerability-assessment.json \
+            --pr-number=${{ github.event.number }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  compliance-check:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run compliance scan
+        run: |
+          npm run github-security-manager:compliance \
+            --frameworks=SOC2,ISO27001,GDPR,PCI-DSS \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate compliance report
+        run: |
+          npm run github-security-manager:compliance-report \
+            --output-file=compliance-report.json \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload compliance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-report-${{ github.run_number }}
+          path: compliance-report.json
+          retention-days: 90
+
+  threat-intelligence:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run threat intelligence check
+        run: |
+          npm run github-security-manager:threat-intelligence \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }} \
+            --cve-database=true \
+            --threat-feeds=true
+
+      - name: Check for new threats
+        run: |
+          npm run github-security-manager:check-threats \
+            --output-file=threat-report.json \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create security issues if threats found
+        if: contains(steps.check-threats.outputs.threats-found, 'true')
+        run: |
+          npm run github-security-manager:create-issues \
+            --threat-file=threat-report.json \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  policy-enforcement:
+    if: github.event_name == 'pull_request'
+    needs: security-scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download security scan results
+        uses: actions/download-artifact@v4
+        with:
+          name: security-scan-${{ github.sha }}
+          path: security-results/
+
+      - name: Enforce security policies
+        run: |
+          npm run github-security-manager:enforce-policy \
+            --security-file=security-results/security-results.json \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Block PR on policy violations
+        if: failure()
+        run: |
+          npm run github-security-manager:block-pr \
+            --pr-number=${{ github.event.number }} \
+            --reason="Security policy violations detected" \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Require security review for critical changes
+        if: contains(needs.security-scan.outputs.critical-issues, 'true')
+        run: |
+          npm run github-security-manager:require-review \
+            --pr-number=${{ github.event.number }} \
+            --reviewers="@security-team" \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  security-dashboard:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [security-scan, vulnerability-assessment]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download security results
+        uses: actions/download-artifact@v4
+        with:
+          name: security-scan-${{ github.sha }}
+          path: security-results/
+
+      - name: Update security dashboard
+        run: |
+          npm run github-security-manager:update-dashboard \
+            --security-file=security-results/security-results.json \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate security metrics
+        run: |
+          npm run github-security-manager:generate-metrics \
+            --output-file=security-metrics.json \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post security status to Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          npm run github-security-manager:notify-slack \
+            --metrics-file=security-metrics.json \
+            --webhook=${{ secrets.SLACK_WEBHOOK_URL }} \
+            --repo=${{ github.repository }}

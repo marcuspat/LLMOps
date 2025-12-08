@@ -1,0 +1,342 @@
+name: GitHub Issue Tracker
+
+on:
+  issues:
+    types: [opened, edited, closed, reopened, labeled, unlabeled, assigned]
+  issue_comment:
+    types: [created, edited, deleted]
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+
+env:
+  ISSUE_TRACKER_AUTO_TRIAGE: true
+  ISSUE_TRACKER_DUPLICATE_DETECTION: true
+  ISSUE_TRACKER_ASSIGNMENT: true
+
+jobs:
+  issue-triage:
+    if: github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    outputs:
+      classification: ${{ steps.triage.outputs.classification }}
+      assignee: ${{ steps.triage.outputs.assignee }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Classify and triage issue
+        id: triage
+        run: |
+          npm run github-issue-tracker:triage \
+            --issue-number=${{ github.event.issue.number }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply classification labels
+        run: |
+          npm run github-issue-tracker:apply-labels \
+            --issue-number=${{ github.event.issue.number }} \
+            --classification=${{ steps.triage.outputs.classification }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assign priority
+        run: |
+          npm run github-issue-tracker:set-priority \
+            --issue-number=${{ github.event.issue.number }} \
+            --classification=${{ steps.triage.outputs.classification }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Estimate complexity
+        run: |
+          npm run github-issue-tracker:estimate-complexity \
+            --issue-number=${{ github.event.issue.number }} \
+            --classification=${{ steps.triage.outputs.classification }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  duplicate-detection:
+    if: github.event.action == 'opened'
+    needs: issue-triage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check for duplicates
+        run: |
+          npm run github-issue-tracker:check-duplicates \
+            --issue-number=${{ github.event.issue.number }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Mark as duplicate if found
+        if: contains(steps.check-duplicates.outputs.duplicate-found, 'true')
+        run: |
+          npm run github-issue-tracker:mark-duplicate \
+            --issue-number=${{ github.event.issue.number }} \
+            --master-issue=${{ steps.check-duplicates.outputs.master-issue }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Comment on duplicate
+        if: contains(steps.check-duplicates.outputs.duplicate-found, 'true')
+        run: |
+          npm run github-issue-tracker:comment-duplicate \
+            --issue-number=${{ github.event.issue.number }} \
+            --master-issue=${{ steps.check-duplicates.outputs.master-issue }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  issue-assignment:
+    if: github.event.action == 'opened' && env.ISSUE_TRACKER_ASSIGNMENT == 'true'
+    needs: [issue-triage, duplicate-detection]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Suggest assignee
+        run: |
+          npm run github-issue-tracker:suggest-assignee \
+            --issue-number=${{ github.event.issue.number }} \
+            --classification=${{ needs.issue-triage.outputs.classification }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Auto-assign if enabled
+        if: env.ISSUE_TRACKER_AUTO_ASSIGN == 'true'
+        run: |
+          npm run github-issue-tracker:auto-assign \
+            --issue-number=${{ github.event.issue.number }} \
+            --classification=${{ needs.issue-triage.outputs.classification }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify assignee
+        if: steps.auto-assign.outputs.assignee != ''
+        run: |
+          npm run github-issue-tracker:notify-assignee \
+            --issue-number=${{ github.event.issue.number }} \
+            --assignee=${{ steps.auto-assign.outputs.assignee }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  issue-analysis:
+    if: github.event.action == 'opened' || github.event.action == 'edited'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Analyze issue content
+        run: |
+          npm run github-issue-tracker:analyze \
+            --issue-number=${{ github.event.issue.number }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract requirements
+        run: |
+          npm run github-issue-tracker:extract-requirements \
+            --issue-number=${{ github.event.issue.number }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Predict resolution time
+        run: |
+          npm run github-issue-tracker:predict-resolution \
+            --issue-number=${{ github.event.issue.number }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  issue-management:
+    if: github.event.action == 'closed' || github.event.action == 'reopened'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Update analytics on close
+        if: github.event.action == 'closed'
+        run: |
+          npm run github-issue-tracker:update-analytics \
+            --issue-number=${{ github.event.issue.number }} \
+            --action=closed \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update analytics on reopen
+        if: github.event.action == 'reopened'
+        run: |
+          npm run github-issue-tracker:update-analytics \
+            --issue-number=${{ github.event.issue.number }} \
+            --action=reopened \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate closure report
+        if: github.event.action == 'closed'
+        run: |
+          npm run github-issue-tracker:closure-report \
+            --issue-number=${{ github.event.issue.number }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  comment-analysis:
+    if: github.event_name == 'issue_comment' && github.event.action == 'created'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Analyze comment
+        run: |
+          npm run github-issue-tracker:analyze-comment \
+            --issue-number=${{ github.event.issue.number }} \
+            --comment-id=${{ github.event.comment.id }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for assignment request
+        if: contains(steps.analyze-comment.outputs.assignment-request, 'true')
+        run: |
+          npm run github-issue-tracker:handle-assignment-request \
+            --issue-number=${{ github.event.issue.number }} \
+            --comment-id=${{ github.event.comment.id }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update issue status
+        if: contains(steps.analyze-comment.outputs.status-change, 'true')
+        run: |
+          npm run github-issue-tracker:update-status \
+            --issue-number=${{ github.event.issue.number }} \
+            --new-status=${{ steps.analyze-comment.outputs.new-status }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  backlog-management:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Analyze backlog
+        run: |
+          npm run github-issue-tracker:analyze-backlog \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate backlog report
+        run: |
+          npm run github-issue-tracker:backlog-report \
+            --output-file=backlog-report.json \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Identify stale issues
+        run: |
+          npm run github-issue-tracker:identify-stale \
+            --days=30 \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Re-prioritize issues
+        run: |
+          npm run github-issue-tracker:reprioritize \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update team assignments
+        run: |
+          npm run github-issue-tracker:rebalance-assignments \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate weekly digest
+        run: |
+          npm run github-issue-tracker:weekly-digest \
+            --output-file=weekly-digest.md \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post digest to Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          npm run github-issue-tracker:post-digest \
+            --digest-file=weekly-digest.md \
+            --webhook=${{ secrets.SLACK_WEBHOOK_URL }} \
+            --repo=${{ github.repository }}

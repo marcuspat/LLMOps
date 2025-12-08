@@ -1,0 +1,217 @@
+name: GitHub PR Manager
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+
+env:
+  PR_MANAGER_AUTO_REVIEW: true
+  PR_MANAGER_QUALITY_THRESHOLD: 0.8
+  PR_MANAGER_REVIEW_TIMEOUT: 24h
+
+jobs:
+  pr-analysis:
+    if: github.event.action == 'opened' || github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+    outputs:
+      analysis-result: ${{ steps.analyze.outputs.result }}
+      review-required: ${{ steps.analyze.outputs.review-required }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run PR analysis
+        id: analyze
+        run: |
+          npm run github-pr-manager:analyze \
+            --pr-number=${{ github.event.number }} \
+            --repo=${{ github.repository }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload analysis results
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-analysis-${{ github.event.number }}
+          path: analysis-results/
+          retention-days: 30
+
+  auto-review:
+    if: env.PR_MANAGER_AUTO_REVIEW == 'true' && needs.pr-analysis.outputs.review-required == 'true'
+    needs: pr-analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download analysis results
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-analysis-${{ github.event.number }}
+          path: analysis-results/
+
+      - name: Generate automated review
+        run: |
+          npm run github-pr-manager:review \
+            --pr-number=${{ github.event.number }} \
+            --analysis-file=analysis-results/result.json \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post review comments
+        run: |
+          npm run github-pr-manager:comment \
+            --pr-number=${{ github.event.number }} \
+            --comments-file=review-comments.json \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  quality-gates:
+    if: github.event.action == 'opened' || github.event.action == 'synchronize'
+    needs: pr-analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download analysis results
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-analysis-${{ github.event.number }}
+          path: analysis-results/
+
+      - name: Check quality gates
+        run: |
+          npm run github-pr-manager:quality-gates \
+            --analysis-file=analysis-results/result.json \
+            --threshold=${{ env.PR_MANAGER_QUALITY_THRESHOLD }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update PR status
+        if: success()
+        run: |
+          npm run github-pr-manager:update-status \
+            --pr-number=${{ github.event.number }} \
+            --status=success \
+            --message="Quality gates passed" \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Block merge on quality gate failure
+        if: failure()
+        run: |
+          npm run github-pr-manager:block-merge \
+            --pr-number=${{ github.event.number }} \
+            --reason="Quality gates failed" \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  reviewer-assignment:
+    if: github.event.action == 'opened' && github.event.pull_request.draft == false
+    needs: pr-analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download analysis results
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-analysis-${{ github.event.number }}
+          path: analysis-results/
+
+      - name: Assign reviewers
+        run: |
+          npm run github-pr-manager:assign-reviewers \
+            --pr-number=${{ github.event.number }} \
+            --analysis-file=analysis-results/result.json \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify reviewers
+        run: |
+          npm run github-pr-manager:notify-reviewers \
+            --pr-number=${{ github.event.number }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  pr-tracking:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Track PR completion
+        run: |
+          npm run github-pr-manager:track-completion \
+            --pr-number=${{ github.event.number }} \
+            --merged=${{ github.event.pull_request.merged }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update metrics
+        run: |
+          npm run github-pr-manager:update-metrics \
+            --pr-number=${{ github.event.number }} \
+            --token=${{ secrets.GITHUB_TOKEN }}
+
+  cleanup:
+    if: always()
+    needs: [pr-analysis, auto-review, quality-gates, reviewer-assignment, pr-tracking]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Cleanup artifacts
+        run: |
+          npm run github-pr-manager:cleanup \
+            --pr-number=${{ github.event.number }} \
+            --retention-days=7
